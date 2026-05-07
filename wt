@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+
+################################################
+############### Git Work-trees #################
+################################################
+
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        cat <<EOF
+'wt' is a wrapper around 'git worktree' to simplify managing multiple worktrees.
+
+Usage: wt <command> [options] [branch/wt name or substring of it]
+
+Commands:
+
+    wt add <branch-name-or-unique-substring>
+        Create a new worktree for the specified branch.
+        - Can be an existing branch (local or remote) or a new branch.
+
+    wt del [-f] <worktree-name-or-unique-substring> 
+        Remove the specified worktree.
+        - Use '-f' to force deletion if needed.
+
+    wt list
+        List all existing worktrees.
+
+    wt rebase [<upstream>]
+        Fetch origin and rebase the current worktree branch.
+        - Defaults to origin/main if no upstream is specified.
+
+    wt <worktree-name-or-unique-substring> 
+        Open the specified worktree.
+
+Environment:
+    WT_BASE   Path to the bare/main repo (required).
+EOF
+        return 1
+    fi
+
+    # Ensure the user has set the base path
+    if [[ -z "${WT_BASE:-}" ]]; then
+        echo "Error: Please set WT_BASE to the target repo."
+        echo "  export WT_BASE=/path/to/your/repo"
+        return 1
+    fi
+
+    local orig_dir="$PWD"
+    cd "$WT_BASE" || return 1
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        add)
+            _wt_add "$1"
+            ;;
+        del)
+            _wt_del "$@"
+            ;;
+        list)
+            _wt_list
+            ;;
+        rebase)
+            _wt_rebase "$orig_dir" "$@"
+            ;;
+        *)
+            _wt_open "$cmd" "$@"
+            ;;
+    esac
+}
+
+_wt_add() {
+    if [[ $# -eq 0 || -z "$1" ]]; then
+        echo "Usage: wt add <branch-name-or-substring>"
+        return 1
+    fi
+
+    # make remote-tracking refs up to date
+    git fetch origin --prune
+
+    local matches count branch output wt_path new_branch=0
+
+    # Find all branches (local + remote) that match the substring, deduplicated
+    matches=$(git branch -a --format='%(refname:short)' | grep -F "$1" | sort -u || true)
+    count=$(printf "%s\n" "$matches" | grep -c . || true)
+
+    # Prioritize exact match over substring matches
+    if (( count > 1 )); then
+        local exact
+        exact=$(printf "%s\n" "$matches" | grep -x "$1" || true)
+        if [[ -n "$exact" ]]; then
+            matches="$exact"
+            count=1
+        fi
+    fi
+    
+    if (( count <= 1 )); then
+        # Strip remote prefix (origin/) but preserve slash-containing branch names
+        branch="${matches#origin/}"
+
+        if (( count == 0 )); then
+            echo "No branch matches: '$1'."
+
+            # get branch create permission
+            read -p "Create a new branch and worktree '$1'? [Y/n] " answer
+            answer=${answer:-Y}  # default to Y if empty
+            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                echo "Aborted!"
+                return 1
+            fi
+
+            echo "Creating new worktree '$1'..."
+            branch="$1"
+            new_branch=1
+        fi
+
+        # Use sanitized directory name (replace slashes with dashes)
+        wt_path="${branch//\//-}"
+
+        # add work tree — argument order differs: -b <branch> <path> vs <path> <branch>
+        if (( new_branch )); then
+            output=$(git worktree add -b "$branch" "$wt_path" 2>&1) || {
+                echo "Failed to create worktree:"
+                echo "$output"
+                return 1
+            }
+        else
+            output=$(git worktree add "$wt_path" "$branch" 2>&1) || {
+                echo "Failed to create worktree:"
+                echo "$output"
+                return 1
+            }
+        fi
+
+        echo "Added worktree '$wt_path' (branch: $branch)"
+    else
+        echo "Multiple branches match '$1':"
+        echo "$matches"
+        return 1
+    fi
+}
+
+_wt_del() {
+    # Parse optional -f flag
+    local force=()
+    if [[ "$1" == "-f" ]]; then
+        force=(-f)
+        shift
+    fi
+
+    if [[ $# -eq 0 || -z "$1" ]]; then
+        echo "Usage: wt del [-f] <worktree-name-or-substring>"
+        return 1
+    fi
+
+    # List all current worktrees and find matches for the substring
+    local matches count output
+    matches=$(git worktree list --porcelain | grep "^worktree " | awk '{print $2}' | grep -F "$1" || true)
+    count=$(printf "%s\n" "$matches" | grep -c . || true)
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "No worktree found matching '$1'"
+        return 1
+
+    elif [[ "$count" -eq 1 ]]; then
+        if ! output=$(git worktree remove "${force[@]}" "${matches##*/}" 2>&1); then
+            echo "worktree is dirty or locked, use -f flag to force delete:"
+            echo ""
+            echo "     wt del -f [wt name]"
+            echo ""
+            echo "$output"
+            return 1
+        fi
+        echo "Removed worktree '$matches'"
+
+    else
+        echo "Multiple worktrees match '$1':"
+        echo "$matches"
+        return 1
+    fi
+}
+
+_wt_list() {
+    printf "%-47s %s\n" "worktree" "commit [branch]"
+    git worktree list | grep -v '(bare)$' | sed -E "s|$WT_BASE/||"
+}
+
+_wt_rebase() {
+    local work_dir="$1"
+    shift
+    local upstream="${1:-origin/main}"
+
+    # Validate we're inside a worktree
+    if ! git -C "$work_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        echo "Error: '$work_dir' is not inside a git worktree."
+        echo "Run 'wt rebase' from within a worktree directory."
+        return 1
+    fi
+
+    git fetch origin --prune
+    git -C "$work_dir" rebase "$upstream"
+}
+
+_wt_open() {
+    if [[ $# -eq 0 || -z "$1" ]]; then
+        echo "Usage: wt <worktree-name-or-substring>"
+        return 1
+    fi
+
+    # Find matching worktree directories (more reliable than branch names)
+    local matches count dir
+    matches=$(git worktree list --porcelain | grep "^worktree " | awk '{print $2}' | grep -F "$1" || true)
+    count=$(printf "%s\n" "$matches" | grep -c . || true)
+
+    if [[ $count -eq 0 ]]; then
+        echo "No worktree found matching '$1'"
+        return 1
+    elif [[ $count -eq 1 ]]; then
+        dir="${matches##*/}"
+
+        if [[ -d "$dir" ]]; then
+            code -r "$dir" || cd "$dir"
+        else
+            echo "Directory '$dir' does not exist"
+            return 1
+        fi
+    else
+        echo "Multiple worktrees match '$1':"
+        echo "$matches"
+        return 1
+    fi
+}
+
+
+# --- Script entry point ---
+main "$@"
